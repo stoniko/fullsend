@@ -457,16 +457,17 @@ runs:
 
     # A container runner image can ship jsonschema already, or ship a Python
     # that pip refuses to modify (an externally managed environment, PEP 668).
-    # Skip the install when the package already imports; otherwise fall back to
-    # --break-system-packages when the plain install is refused. The consumers
-    # (fullsend-check-output) call the system python3, so the package must land
-    # in its site-packages rather than in a venv.
+    # Skip the install when the package already imports and its installed
+    # version meets the 4.18.0 floor (Draft 2020-12 support); otherwise fall
+    # back to --break-system-packages when the plain install is refused. The
+    # consumers (fullsend-check-output) call the system python3, so the package
+    # must land in its site-packages rather than in a venv.
     - name: Install validation dependencies
       shell: bash
       run: |
         set -euo pipefail
-        if python3 -c "import jsonschema" >/dev/null 2>&1; then
-          echo "jsonschema is already installed, skipping install"
+        if python3 -c 'import importlib.metadata as m, re, sys, jsonschema; v = re.match(r"(\d+)\.(\d+)", m.version("jsonschema")); sys.exit(0 if v and (int(v[1]), int(v[2])) >= (4, 18) else 1)' >/dev/null 2>&1; then
+          echo "jsonschema >=4.18.0 is already installed, skipping install"
           exit 0
         fi
         if ! python3 -m pip install --quiet "jsonschema>=4.18.0"; then

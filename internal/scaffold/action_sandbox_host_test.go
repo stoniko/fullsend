@@ -125,14 +125,17 @@ func TestActionLocalSandboxHostStepsAreGated(t *testing.T) {
 }
 
 // runInstallValidationDeps runs the "Install validation dependencies" step
-// script with a fake python3 on PATH. The fake succeeds at `-c "import ..."`
-// only when importOK is true, refuses `-m pip install` without
-// --break-system-packages when externallyManaged is true, and fails every pip
-// install when pipBroken is true. It returns the pip invocations and the
-// script's error.
-func runInstallValidationDeps(t *testing.T, script string, importOK, externallyManaged, pipBroken bool) ([]string, error) {
+// script with a fake python3 on PATH. The fake runs `-c` probes with the real
+// interpreter against a stub jsonschema distribution of version installed (an
+// empty installed makes the import fail), refuses `-m pip install`
+// without --break-system-packages when externallyManaged is true, and fails
+// every pip install when pipBroken is true. It returns the pip invocations and
+// the script's error.
+func runInstallValidationDeps(t *testing.T, script, installed string, externallyManaged, pipBroken bool) ([]string, error) {
 	t.Helper()
 	bash, err := exec.LookPath("bash")
+	require.NoError(t, err)
+	realPython, err := exec.LookPath("python3")
 	require.NoError(t, err)
 
 	dir := t.TempDir()
@@ -141,10 +144,27 @@ func runInstallValidationDeps(t *testing.T, script string, importOK, externallyM
 	logPath := filepath.Join(dir, "pip.log")
 	require.NoError(t, os.WriteFile(logPath, nil, 0o600))
 
+	sitePath := filepath.Join(dir, "site")
+	require.NoError(t, os.Mkdir(sitePath, 0o700))
+	// The stub package shadows any jsonschema on the host interpreter: it
+	// imports when a version is given and raises ImportError otherwise.
+	pkgDir := filepath.Join(sitePath, "jsonschema")
+	require.NoError(t, os.Mkdir(pkgDir, 0o700))
+	initSrc := ""
+	if installed == "" {
+		initSrc = "raise ImportError('jsonschema is not installed')\n"
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(pkgDir, "__init__.py"), []byte(initSrc), 0o600))
+	if installed != "" {
+		distDir := filepath.Join(sitePath, "jsonschema-"+installed+".dist-info")
+		require.NoError(t, os.Mkdir(distDir, 0o700))
+		meta := "Metadata-Version: 2.1\nName: jsonschema\nVersion: " + installed + "\n"
+		require.NoError(t, os.WriteFile(filepath.Join(distDir, "METADATA"), []byte(meta), 0o600))
+	}
+
 	fake := `#!/bin/sh
 if [ "$1" = "-c" ]; then
-  [ "$FAKE_IMPORT_OK" = "1" ] && exit 0
-  exit 1
+  PYTHONPATH="$FAKE_SITE" exec "$FAKE_REAL_PYTHON" "$@"
 fi
 if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then
   echo "$*" >> "$FAKE_PIP_LOG"
@@ -173,7 +193,8 @@ exit 2
 	cmd.Env = []string{
 		"PATH=" + binDir,
 		"FAKE_PIP_LOG=" + logPath,
-		"FAKE_IMPORT_OK=" + flag(importOK),
+		"FAKE_SITE=" + sitePath,
+		"FAKE_REAL_PYTHON=" + realPython,
 		"FAKE_EXTERNALLY_MANAGED=" + flag(externallyManaged),
 		"FAKE_PIP_BROKEN=" + flag(pipBroken),
 	}
@@ -196,14 +217,27 @@ func TestActionInstallValidationDependenciesStep(t *testing.T) {
 	require.True(t, ok, "action.yml must have an Install validation dependencies step")
 	require.NotEmpty(t, step.Run)
 
-	t.Run("already installed skips pip", func(t *testing.T) {
-		calls, err := runInstallValidationDeps(t, step.Run, true, true, false)
+	t.Run("already installed at the floor skips pip", func(t *testing.T) {
+		calls, err := runInstallValidationDeps(t, step.Run, "4.18.0", true, false)
 		require.NoError(t, err)
 		assert.Empty(t, calls)
 	})
 
+	t.Run("already installed above the floor skips pip", func(t *testing.T) {
+		calls, err := runInstallValidationDeps(t, step.Run, "4.26.0", true, false)
+		require.NoError(t, err)
+		assert.Empty(t, calls)
+	})
+
+	t.Run("importable but outdated package triggers install", func(t *testing.T) {
+		calls, err := runInstallValidationDeps(t, step.Run, "4.17.3", false, false)
+		require.NoError(t, err)
+		require.Len(t, calls, 1)
+		assert.Contains(t, calls[0], "jsonschema>=4.18.0")
+	})
+
 	t.Run("plain install succeeds without the override flag", func(t *testing.T) {
-		calls, err := runInstallValidationDeps(t, step.Run, false, false, false)
+		calls, err := runInstallValidationDeps(t, step.Run, "", false, false)
 		require.NoError(t, err)
 		require.Len(t, calls, 1)
 		assert.NotContains(t, calls[0], "--break-system-packages")
@@ -211,7 +245,7 @@ func TestActionInstallValidationDependenciesStep(t *testing.T) {
 	})
 
 	t.Run("externally managed environment retries with the override flag", func(t *testing.T) {
-		calls, err := runInstallValidationDeps(t, step.Run, false, true, false)
+		calls, err := runInstallValidationDeps(t, step.Run, "", true, false)
 		require.NoError(t, err)
 		require.Len(t, calls, 2)
 		assert.NotContains(t, calls[0], "--break-system-packages")
@@ -220,7 +254,7 @@ func TestActionInstallValidationDependenciesStep(t *testing.T) {
 	})
 
 	t.Run("a pip that always fails fails the step", func(t *testing.T) {
-		_, err := runInstallValidationDeps(t, step.Run, false, false, true)
+		_, err := runInstallValidationDeps(t, step.Run, "", false, true)
 		require.Error(t, err)
 	})
 }
