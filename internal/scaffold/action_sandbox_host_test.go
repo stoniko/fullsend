@@ -123,3 +123,104 @@ func TestActionLocalSandboxHostStepsAreGated(t *testing.T) {
 	require.True(t, ok, "action.yml must have a Run fullsend step")
 	assert.NotContains(t, run.If, "sandbox-host", "Run fullsend must run whichever sandbox host the runner uses")
 }
+
+// runInstallValidationDeps runs the "Install validation dependencies" step
+// script with a fake python3 on PATH. The fake succeeds at `-c "import ..."`
+// only when importOK is true, refuses `-m pip install` without
+// --break-system-packages when externallyManaged is true, and fails every pip
+// install when pipBroken is true. It returns the pip invocations and the
+// script's error.
+func runInstallValidationDeps(t *testing.T, script string, importOK, externallyManaged, pipBroken bool) ([]string, error) {
+	t.Helper()
+	bash, err := exec.LookPath("bash")
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	require.NoError(t, os.Mkdir(binDir, 0o700))
+	logPath := filepath.Join(dir, "pip.log")
+	require.NoError(t, os.WriteFile(logPath, nil, 0o600))
+
+	fake := `#!/bin/sh
+if [ "$1" = "-c" ]; then
+  [ "$FAKE_IMPORT_OK" = "1" ] && exit 0
+  exit 1
+fi
+if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then
+  echo "$*" >> "$FAKE_PIP_LOG"
+  [ "$FAKE_PIP_BROKEN" = "1" ] && exit 1
+  if [ "$FAKE_EXTERNALLY_MANAGED" = "1" ]; then
+    case "$*" in
+      *--break-system-packages*) exit 0 ;;
+      *) echo "error: externally-managed-environment" >&2; exit 1 ;;
+    esac
+  fi
+  exit 0
+fi
+exit 2
+`
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "python3"), []byte(fake), 0o700))
+	scriptPath := filepath.Join(dir, "step.sh")
+	require.NoError(t, os.WriteFile(scriptPath, []byte(script), 0o600))
+
+	flag := func(b bool) string {
+		if b {
+			return "1"
+		}
+		return "0"
+	}
+	cmd := exec.Command(bash, scriptPath)
+	cmd.Env = []string{
+		"PATH=" + binDir,
+		"FAKE_PIP_LOG=" + logPath,
+		"FAKE_IMPORT_OK=" + flag(importOK),
+		"FAKE_EXTERNALLY_MANAGED=" + flag(externallyManaged),
+		"FAKE_PIP_BROKEN=" + flag(pipBroken),
+	}
+	_, runErr := cmd.CombinedOutput()
+
+	raw, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	var calls []string
+	for line := range strings.SplitSeq(strings.TrimSpace(string(raw)), "\n") {
+		if line != "" {
+			calls = append(calls, line)
+		}
+	}
+	return calls, runErr
+}
+
+func TestActionInstallValidationDependenciesStep(t *testing.T) {
+	steps := loadRootActionSteps(t)
+	step, ok := steps["Install validation dependencies"]
+	require.True(t, ok, "action.yml must have an Install validation dependencies step")
+	require.NotEmpty(t, step.Run)
+
+	t.Run("already installed skips pip", func(t *testing.T) {
+		calls, err := runInstallValidationDeps(t, step.Run, true, true, false)
+		require.NoError(t, err)
+		assert.Empty(t, calls)
+	})
+
+	t.Run("plain install succeeds without the override flag", func(t *testing.T) {
+		calls, err := runInstallValidationDeps(t, step.Run, false, false, false)
+		require.NoError(t, err)
+		require.Len(t, calls, 1)
+		assert.NotContains(t, calls[0], "--break-system-packages")
+		assert.Contains(t, calls[0], "jsonschema>=4.18.0")
+	})
+
+	t.Run("externally managed environment retries with the override flag", func(t *testing.T) {
+		calls, err := runInstallValidationDeps(t, step.Run, false, true, false)
+		require.NoError(t, err)
+		require.Len(t, calls, 2)
+		assert.NotContains(t, calls[0], "--break-system-packages")
+		assert.Contains(t, calls[1], "--break-system-packages")
+		assert.Contains(t, calls[1], "jsonschema>=4.18.0")
+	})
+
+	t.Run("a pip that always fails fails the step", func(t *testing.T) {
+		_, err := runInstallValidationDeps(t, step.Run, false, false, true)
+		require.Error(t, err)
+	})
+}

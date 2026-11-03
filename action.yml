@@ -455,9 +455,24 @@ runs:
       shell: bash
       run: "$GITHUB_ACTION_PATH/.github/scripts/install-openshell.sh"
 
+    # A container runner image can ship jsonschema already, or ship a Python
+    # that pip refuses to modify (an externally managed environment, PEP 668).
+    # Skip the install when the package already imports; otherwise fall back to
+    # --break-system-packages when the plain install is refused. The consumers
+    # (fullsend-check-output) call the system python3, so the package must land
+    # in its site-packages rather than in a venv.
     - name: Install validation dependencies
       shell: bash
-      run: pip install --quiet "jsonschema>=4.18.0"
+      run: |
+        set -euo pipefail
+        if python3 -c "import jsonschema" >/dev/null 2>&1; then
+          echo "jsonschema is already installed, skipping install"
+          exit 0
+        fi
+        if ! python3 -m pip install --quiet "jsonschema>=4.18.0"; then
+          echo "pip install was refused, retrying with --break-system-packages (externally managed Python)"
+          python3 -m pip install --quiet --break-system-packages "jsonschema>=4.18.0"
+        fi
 
     - name: Set up Go for target repo pre-commit hooks
       if: hashFiles(format('{0}/go.mod', inputs.target-repo)) != ''

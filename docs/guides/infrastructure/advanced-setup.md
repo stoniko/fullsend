@@ -115,6 +115,11 @@ OpenShell CLI installer, which needs `sudo` and starts a local gateway
 service. Install the CLI version pinned in
 `.github/scripts/openshell-version.sh` in the runner image.
 
+The action also needs the Python `jsonschema` package to validate agent
+output. It skips the install when `python3` can already import the package. On
+a container image whose Python is an externally managed environment, the
+action retries the install with `--break-system-packages`.
+
 ### Custom app sets
 
 By default, the installer creates GitHub Apps with the `fullsend-ai` prefix (e.g., `fullsend-ai-fullsend`, `fullsend-ai-coder`, `fullsend-ai-review`). Organizations that need their own set of apps — for example, to use org-specific permissions or to register multiple app sets on the same mint — can pass `--app-set` to override the prefix.
